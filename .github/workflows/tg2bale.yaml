@@ -1,0 +1,56 @@
+name: Telegram File Forwarder
+
+on:
+  repository_dispatch:
+    types: [telegram_file]
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install 7z
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Download Telegram file
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        run: |
+          FILE_ID='${{ github.event.client_payload.file_id }}'
+
+          FILE_INFO=$(curl -s \
+            "https://api.telegram.org/bot$TG_TOKEN/getFile?file_id=$FILE_ID")
+
+          FILE_PATH=$(echo "$FILE_INFO" | jq -r '.result.file_path')
+
+          curl -L \
+            "https://api.telegram.org/file/bot$TG_TOKEN/$FILE_PATH" \
+            -o input.bin
+
+      - name: Split if >20MB
+        run: |
+          SIZE=$(stat -c%s input.bin)
+
+          if [ "$SIZE" -gt 20000000 ]; then
+            7z a -v19m split.7z input.bin
+          else
+            mkdir out
+            cp input.bin out/
+          fi
+
+      - name: Upload to Bale
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_TOKEN }}
+          BALE_CHAT_ID: ${{ secrets.BALE_CHAT_ID }}
+        run: |
+          if ls split.7z.* 1>/dev/null 2>&1; then
+            for f in split.7z.*; do
+              curl -F chat_id="$BALE_CHAT_ID" \
+                   -F document=@"$f" \
+                   "https://tapi.bale.ai/bot$BALE_TOKEN/sendDocument"
+            done
+          else
+            curl -F chat_id="$BALE_CHAT_ID" \
+                 -F document=@input.bin \
+                 "https://tapi.bale.ai/bot$BALE_TOKEN/sendDocument"
+          fi
