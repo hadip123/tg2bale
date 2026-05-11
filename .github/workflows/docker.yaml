@@ -1,58 +1,220 @@
-name: Save and Commit Feishin Image to Repository
+name: "Docker Image Mirror to Repository"
 
 on:
-  workflow_dispatch:  # Manual trigger
-  schedule:
-    - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: "Docker image URL (e.g., ghcr.io/jeffvli/feishin:latest or nginx:alpine)"
+        required: true
+        type: string
+      
+      registry_username:
+        description: "Registry username (leave empty if public)"
+        required: false
+        type: string
+      
+      registry_password:
+        description: "Registry password/token (leave empty if public)"
+        required: false
+        type: string
+      
+      compress:
+        description: "Compress the tar file"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      
+      split_parts:
+        description: "Split into parts (MB, 0 = no split)"
+        required: false
+        default: "0"
+        type: string
+      
+      password:
+        description: "Password for archive (leave empty for no password)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  save-and-commit:
+  mirror-docker-image:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 60
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Pull Feishin image from GHCR
+
+      - name: Install Dependencies
         run: |
-          docker pull ghcr.io/jeffvli/feishin:latest
-      
-      - name: Save Docker image to tar file
+          sudo apt-get update -qq
+          sudo apt-get install -y pigz p7zip-full
+
+      - name: Parse Image URL
+        id: parse
+        shell: bash
         run: |
-          docker save -o feishin.tar ghcr.io/jeffvli/feishin:latest
-          # Optional: compress to save space
-          gzip feishin.tar
-      
-      - name: Get image info for commit message
-        id: image-info
+          IMAGE_URL="${{ github.event.inputs.image_url }}"
+          
+          # Parse registry, image name, and tag
+          if [[ "$IMAGE_URL" =~ ^([^/]+)/([^:]+):(.+)$ ]]; then
+            # Full registry URL
+            REGISTRY="${BASH_REMATCH[1]}"
+            IMAGE_NAME="${BASH_REMATCH[2]}"
+            TAG="${BASH_REMATCH[3]}"
+          elif [[ "$IMAGE_URL" =~ ^([^:]+):(.+)$ ]]; then
+            # Docker Hub format (library image)
+            REGISTRY="docker.io"
+            IMAGE_NAME="${BASH_REMATCH[1]}"
+            TAG="${BASH_REMATCH[2]}"
+          else
+            echo "Error: Invalid image URL format"
+            exit 1
+          fi
+          
+          # Clean up image name for filename
+          SAFE_NAME=$(echo "$IMAGE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          SAFE_REGISTRY=$(echo "$REGISTRY" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "safe_name=${SAFE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "safe_registry=${SAFE_REGISTRY}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Registry (if credentials provided)
+        if: ${{ github.event.inputs.registry_username != '' && github.event.inputs.registry_password != '' }}
+        shell: bash
         run: |
-          IMAGE_ID=$(docker inspect ghcr.io/jeffvli/feishin:latest --format='{{.Id}}')
-          echo "image_id=${IMAGE_ID}" >> $GITHUB_OUTPUT
-          echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-      
-      - name: Commit and push the tar file
+          echo "${{ github.event.inputs.registry_password }}" | docker login \
+            "${{ steps.parse.outputs.registry }}" \
+            -u "${{ github.event.inputs.registry_username }}" \
+            --password-stdin
+
+      - name: Pull Docker Image
+        id: pull
+        shell: bash
+        run: |
+          IMAGE_URL="${{ github.event.inputs.image_url }}"
+          
+          echo "Pulling: ${IMAGE_URL}"
+          docker pull "${IMAGE_URL}"
+          
+          # Get image info
+          IMAGE_ID=$(docker inspect "${IMAGE_URL}" --format='{{.Id}}' | cut -d: -f2 | cut -c1-12)
+          IMAGE_SIZE=$(docker inspect "${IMAGE_URL}" --format='{{.Size}}')
+          IMAGE_SIZE_MB=$((IMAGE_SIZE / 1024 / 1024))
+          CREATED=$(docker inspect "${IMAGE_URL}" --format='{{.Created}}' | cut -dT -f1)
+          
+          echo "image_id=${IMAGE_ID}" >> "$GITHUB_OUTPUT"
+          echo "image_size_mb=${IMAGE_SIZE_MB}" >> "$GITHUB_OUTPUT"
+          echo "created=${CREATED}" >> "$GITHUB_OUTPUT"
+          
+          echo "✓ Image pulled successfully"
+          echo "  ID: ${IMAGE_ID}"
+          echo "  Size: ${IMAGE_SIZE_MB} MB"
+          echo "  Created: ${CREATED}"
+
+      - name: Save Docker Image
+        id: save
+        shell: bash
+        run: |
+          IMAGE_URL="${{ github.event.inputs.image_url }}"
+          COMPRESS="${{ github.event.inputs.compress }}"
+          SPLIT_MB="${{ github.event.inputs.split_parts }}"
+          PASS="${{ github.event.inputs.password }}"
+          
+          SAFE_REGISTRY="${{ steps.parse.outputs.safe_registry }}"
+          SAFE_NAME="${{ steps.parse.outputs.safe_name }}"
+          TAG="${{ steps.parse.outputs.tag }}"
+          IMAGE_ID="${{ steps.pull.outputs.image_id }}"
+          
+          DATE=$(date '+%Y%m%d_%H%M%S')
+          BASE_FILENAME="${SAFE_REGISTRY}_${SAFE_NAME}_${TAG}_${IMAGE_ID}_${DATE}"
+          
+          mkdir -p docker_images
+          cd docker_images || exit 1
+          
+          if [[ "$COMPRESS" == "true" ]]; then
+            echo "Saving and compressing image..."
+            docker save "${IMAGE_URL}" | pigz -c > "${BASE_FILENAME}.tar.gz"
+            FINAL_FILE="${BASE_FILENAME}.tar.gz"
+          else
+            echo "Saving image (uncompressed)..."
+            docker save "${IMAGE_URL}" -o "${BASE_FILENAME}.tar"
+            FINAL_FILE="${BASE_FILENAME}.tar"
+          fi
+          
+          # Split if requested
+          if [[ "$SPLIT_MB" -gt 0 && "$SPLIT_MB" -le 1900 ]]; then
+            echo "Splitting into ${SPLIT_MB}MB parts..."
+            if [ -n "$PASS" ]; then
+              7z a -p"$PASS" -mx=0 -v${SPLIT_MB}m "archive.7z" "${FINAL_FILE}"
+              mv archive.7z.001 "${BASE_FILENAME}.7z.001"
+              FINAL_FILE="${BASE_FILENAME}.7z.001"
+            else
+              split -b ${SPLIT_MB}M "${FINAL_FILE}" "${BASE_FILENAME}.part_"
+              FINAL_FILE="${BASE_FILENAME}.part_aa"
+            fi
+          fi
+          
+          echo "final_file=${FINAL_FILE}" >> "$GITHUB_OUTPUT"
+          echo "base_filename=${BASE_FILENAME}" >> "$GITHUB_OUTPUT"
+          
+          cd ..
+          
+          # Get file size
+          FILE_SIZE=$(du -sh "docker_images/${FINAL_FILE}" | cut -f1)
+          echo "file_size=${FILE_SIZE}" >> "$GITHUB_OUTPUT"
+          
+          echo "✓ Image saved to: docker_images/${FINAL_FILE}"
+          echo "  Size: ${FILE_SIZE}"
+
+      - name: Get Current Date
+        id: get_date
+        shell: bash
+        run: |
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Push to Repository
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Add the tar file (or tar.gz if compressed)
-          git add feishin.tar.gz
-          
-          # Commit only if there are changes
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
+          # Check if files were split or not
+          if [ -f "docker_images/${{ steps.save.outputs.final_file }}" ]; then
+            git add docker_images/
           else
-            git commit -m "Update Feishin image - ${{ steps.image-info.outputs.date }}
-            
-            Image ID: ${{ steps.image-info.outputs.image_id }}
-            Source: ghcr.io/jeffvli/feishin:latest
-            Auto-committed by GitHub Actions"
-            
-            git push origin HEAD:${{ github.ref_name }}
+            git add docker_images/
           fi
-      
-      - name: Clean up
+          
+          git commit -m "Mirror: ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.tag }}
+          
+Registry: ${{ steps.parse.outputs.registry }}
+Image ID: ${{ steps.pull.outputs.image_id }}
+Size: ${{ steps.pull.outputs.image_size_mb }} MB (compressed: ${{ steps.save.outputs.file_size }})
+Date: ${{ steps.get_date.outputs.date }}
+Source: ${{ github.event.inputs.image_url }}
+
+[skip ci]" || echo "Nothing to commit"
+          
+          git push
+
+      - name: Cleanup
+        if: always()
+        shell: bash
         run: |
-          rm -f feishin.tar.gz
+          docker system prune -af
+          rm -rf docker_images
