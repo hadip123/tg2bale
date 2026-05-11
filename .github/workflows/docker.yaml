@@ -202,13 +202,13 @@ jobs:
           
           git commit -m "Mirror: ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.tag }}
           
-Registry: ${{ steps.parse.outputs.registry }}
-Image ID: ${{ steps.pull.outputs.image_id }}
-Size: ${{ steps.pull.outputs.image_size_mb }} MB (compressed: ${{ steps.save.outputs.file_size }})
-Date: ${{ steps.get_date.outputs.date }}
-Source: ${{ github.event.inputs.image_url }}
+          Registry: ${{ steps.parse.outputs.registry }}
+          Image ID: ${{ steps.pull.outputs.image_id }}
+          Size: ${{ steps.pull.outputs.image_size_mb }} MB (compressed: ${{ steps.save.outputs.file_size }})
+          Date: ${{ steps.get_date.outputs.date }}
+          Source: ${{ github.event.inputs.image_url }}
 
-[skip ci]" || echo "Nothing to commit"
+          [skip ci]" || echo "Nothing to commit"
           
           git push
 
