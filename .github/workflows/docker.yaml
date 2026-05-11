@@ -1,0 +1,58 @@
+name: Save and Commit Feishin Image to Repository
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM
+
+jobs:
+  save-and-commit:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Pull Feishin image from GHCR
+        run: |
+          docker pull ghcr.io/jeffvli/feishin:latest
+      
+      - name: Save Docker image to tar file
+        run: |
+          docker save -o feishin.tar ghcr.io/jeffvli/feishin:latest
+          # Optional: compress to save space
+          gzip feishin.tar
+      
+      - name: Get image info for commit message
+        id: image-info
+        run: |
+          IMAGE_ID=$(docker inspect ghcr.io/jeffvli/feishin:latest --format='{{.Id}}')
+          echo "image_id=${IMAGE_ID}" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+      
+      - name: Commit and push the tar file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add the tar file (or tar.gz if compressed)
+          git add feishin.tar.gz
+          
+          # Commit only if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update Feishin image - ${{ steps.image-info.outputs.date }}
+            
+            Image ID: ${{ steps.image-info.outputs.image_id }}
+            Source: ghcr.io/jeffvli/feishin:latest
+            Auto-committed by GitHub Actions"
+            
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+      
+      - name: Clean up
+        run: |
+          rm -f feishin.tar.gz

@@ -1,0 +1,29 @@
+name: Simple Input Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_one:
+        description: "Chat ID"
+        required: true
+        type: string
+      input_two:
+        description: "Message ID"
+        required: true
+        type: string
+
+jobs:
+  Download Files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print inputs
+        run: |
+          BOT_TOKEN="YOUR_BOT_TOKEN"
+          FILE_ID="YOUR_FILE_ID"
+
+          FILE_PATH=$(curl -s \
+            "https://api.telegram.org/bot$BOT_TOKEN/getFile?file_id=$FILE_ID" \
+            | jq -r '.result.file_path')
+
+          curl -o file.bin \
+            "https://api.telegram.org/file/bot$BOT_TOKEN/$FILE_PATH"
