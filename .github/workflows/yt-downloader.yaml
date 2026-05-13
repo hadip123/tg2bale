@@ -49,7 +49,7 @@ jobs:
       - name: 🍪 Set up cookies (if available)
         run: |
           if [ -n "${{ secrets.YT_COOKIES }}" ]; then
-            curl -L https://raw.githubusercontent.com/hadip123/ir-downloader/refs/heads/main/cookies.txt -o cookies_enc.txt
+            curl -L https://raw.githubusercontent.com/hadip123/tg2bale/refs/heads/main/cookies.txt -o cookies_enc.txt
             openssl enc -aes-128-cbc -base64 -d -in cookies_enc.txt -out cookies.txt -pass pass:"${{ secrets.YT_COOKIES }}"
             echo "✅ Cookies loaded"
           fi
