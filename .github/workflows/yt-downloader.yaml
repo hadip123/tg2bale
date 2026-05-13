@@ -1,0 +1,275 @@
+name: '📥 YouTube Download & Archive (to Bale) arch'
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_urls:
+        description: '🔗 YouTube video URLs (comma separated)'
+        required: true
+        type: string
+      format:
+        description: '📁 Format (video/audio)'
+        required: false
+        type: choice
+        default: 'video'
+        options:
+          - 'video'
+          - 'audio'
+      password:
+        description: '🔐 Zip password (optional)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: '📦 Split size per part (default: 95m)'
+        required: false
+        type: string
+        default: '95m'
+
+permissions:
+  contents: write
+
+jobs:
+  download-youtube-and-upload:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --user root
+    steps:
+      - name: ⚙️ Install dependencies (Arch)
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm curl wget p7zip ffmpeg file nodejs npm python python-pip git base-devel
+          npm install -g jsdom
+          pip install yt-dlp --break-system-packages
+          
+          # Ensure yt-dlp uses node
+          yt-dlp --version
+
+      - name: 🍪 Set up cookies (if available)
+        run: |
+          if [ -n "${{ secrets.YT_COOKIES }}" ]; then
+            curl -L https://raw.githubusercontent.com/hadip123/ir-downloader/refs/heads/main/cookies.txt -o cookies_enc.txt
+            openssl enc -aes-128-cbc -base64 -d -in cookies_enc.txt -out cookies.txt -pass pass:"${{ secrets.YT_COOKIES }}"
+            echo "✅ Cookies loaded"
+          fi
+
+      - name: 📊 Download from YouTube
+        id: download
+        run: |
+          IFS=',' read -ra URLS <<< "${{ github.event.inputs.youtube_urls }}"
+          FORMAT="${{ github.event.inputs.format }}"
+          
+          echo "Node version: $(node --version)"
+          echo "yt-dlp version: $(yt-dlp --version)"
+          
+          YT_CMD_BASE="yt-dlp --js-runtimes node --remote-components ejs:github"
+          
+          if [ -f "cookies.txt" ]; then
+            YT_CMD_BASE="$YT_CMD_BASE --cookies cookies.txt"
+          fi
+          
+          if [ "$FORMAT" = "audio" ]; then
+            YT_CMD_BASE="$YT_CMD_BASE -x --audio-format mp3 --audio-quality 0 --embed-metadata"
+          else
+            YT_CMD_BASE="$YT_CMD_BASE -S 'height:480'"
+          fi
+          
+          mkdir -p downloads
+          
+          TOTAL_VIDEOS=${#URLS[@]}
+          CURRENT_VIDEO=0
+          ALL_TITLES=""
+          
+          for URL in "${URLS[@]}"; do
+            CURRENT_VIDEO=$((CURRENT_VIDEO + 1))
+            URL=$(echo "$URL" | xargs) # Trim whitespace
+
+            echo ""
+            echo "========================================="
+            echo "📥 Downloading video $CURRENT_VIDEO of $TOTAL_VIDEOS"
+            echo "🔗 URL: $URL"
+            echo "========================================="
+            # Add format suffix to filename (optional)
+            if [ "$FORMAT" = "audio" ]; then
+              OUTPUT_TEMPLATE="downloads/%(channel)s - %(upload_date)s - %(title)s_audio.%(ext)s"
+            else
+              OUTPUT_TEMPLATE="downloads/%(channel)s - %(upload_date)s - %(title)s_video.%(ext)s"
+            fi
+            # Download with custom output template
+            YT_CMD="$YT_CMD_BASE --output \"$OUTPUT_TEMPLATE\" \"$URL\""
+
+            echo "🎯 Output pattern: $OUTPUT_TEMPLATE"
+            echo "Executing: $YT_CMD"
+            eval $YT_CMD
+
+            # Check if download succeeded
+            if [ $? -ne 0 ]; then
+              echo "❌ Failed to download: $URL"
+              exit 1
+            fi
+
+            # Get the most recently downloaded file in downloads/
+            DOWNLOADED_FILE=$(ls -t downloads/* 2>/dev/null | head -n1)
+
+            if [ -z "$DOWNLOADED_FILE" ] || [ ! -f "$DOWNLOADED_FILE" ]; then
+              echo "❌ Cannot find downloaded file for: $URL"
+              exit 1
+            fi
+
+            echo "✅ Downloaded: $(basename "$DOWNLOADED_FILE")"
+            ls -lh "$DOWNLOADED_FILE"
+
+            # Store the filename (without extension) for later processing
+            SAFE_NAME=$(basename "$DOWNLOADED_FILE" | sed 's/\.[^.]*$//')
+            ALL_TITLES="${ALL_TITLES}${SAFE_NAME}\n"
+          done
+          
+          echo "ALL_TITLES=$ALL_TITLES" >> $GITHUB_ENV
+          echo "TOTAL_VIDEOS=$TOTAL_VIDEOS" >> $GITHUB_ENV
+          
+      - name: 🗜️ Compress and split each video
+        run: |
+          mkdir -p temp_split
+          rm -f temp_split/*.7z*
+          
+          TOTAL_VIDEOS="${{ env.TOTAL_VIDEOS }}"
+          CURRENT_VIDEO=0
+          
+          for FILE in downloads/*; do
+            CURRENT_VIDEO=$((CURRENT_VIDEO + 1))
+            FILENAME=$(basename "$FILE")
+            BASENAME="$(cat /dev/urandom | tr -dc "a-z0-9A-Z" | fold -w 10 | head -n 1)" # Remove extension
+            
+            echo ""
+            echo "========================================="
+            echo "📦 Processing video $CURRENT_VIDEO of $TOTAL_VIDEOS: $BASENAME"
+            echo "========================================="
+            
+            if [ -z "${{ github.event.inputs.password }}" ]; then
+              7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "temp_split/${BASENAME}.7z" "$FILE"
+            else
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "temp_split/${BASENAME}.7z" "$FILE"
+            fi
+            
+            echo "✅ Created split files for: $BASENAME"
+          done
+          
+          echo "✅ All videos processed"
+          ls -lh temp_split/
+          
+      - name: 📤 Upload parts to Bale Bot API
+        env:
+          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          BALE_CHAT_ID: ${{ secrets.BALE_CHAT_ID }}
+        run: |
+          if [ -z "$BALE_BOT_TOKEN" ] || [ -z "$BALE_CHAT_ID" ]; then
+            echo "❌ BALE_BOT_TOKEN or BALE_CHAT_ID secrets not set!"
+            exit 1
+          fi
+          
+          TOTAL_PARTS=$(ls temp_split/*.7z* 2>/dev/null | wc -l)
+          CURRENT_PART=0
+          CURRENT_VIDEO=""
+          VIDEO_COUNTER=1
+          
+          # First, send a message that upload is starting
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${BALE_CHAT_ID}\",\"text\":\"🚀 Starting upload of ${TOTAL_PARTS} parts for ${{ env.TOTAL_VIDEOS }} video(s)...\"}"
+          
+          for FILE in temp_split/*.7z*; do
+            CURRENT_PART=$((CURRENT_PART + 1))
+            FILENAME=$(basename "$FILE")
+            FILE_SIZE=$(stat -c%s "$FILE")
+            FILE_SIZE_MB=$((FILE_SIZE / 1048576))
+            
+            # Extract video name from filename (remove .7z.001, .7z.002, etc)
+            VIDEO_NAME=$(echo "$FILENAME" | sed 's/\.7z\.[0-9]*$//' | sed 's/\.7z$//')
+            
+            # Check if we moved to a new video
+            if [ "$VIDEO_NAME" != "$CURRENT_VIDEO" ]; then
+              if [ -n "$CURRENT_VIDEO" ]; then
+                echo "" >> /tmp/upload_log
+              fi
+              CURRENT_VIDEO="$VIDEO_NAME"
+              echo "" >> /tmp/upload_log
+              echo "📹 Video $VIDEO_COUNTER: $VIDEO_NAME" >> /tmp/upload_log
+              VIDEO_COUNTER=$((VIDEO_COUNTER + 1))
+            fi
+            
+            echo "📤 Uploading part $CURRENT_PART of $TOTAL_PARTS: $FILENAME (${FILE_SIZE_MB} MB)"
+            echo "  Part $CURRENT_PART of $VIDEO_NAME" >> /tmp/upload_log
+            
+            MAX_RETRIES=5
+            RETRY_COUNT=0
+            UPLOAD_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$UPLOAD_SUCCESS" = false ]; do
+              RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${BALE_CHAT_ID}" \
+                -F "document=@${FILE}" \
+                -F "caption=📥 ${FILENAME}%0A📏 Size: ${FILE_SIZE_MB} MB%0A📊 Progress: ${CURRENT_PART}/${TOTAL_PARTS}")
+              
+              if echo "$RESPONSE" | grep -q '"ok":true'; then
+                echo "✅ Part $CURRENT_PART uploaded successfully!"
+                UPLOAD_SUCCESS=true
+              else
+                echo "❌ Upload failed (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+                echo "Response: $RESPONSE"
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  echo "🔄 Retrying in 3 seconds..."
+                  sleep 3
+                fi
+              fi
+            done
+            
+            if [ "$UPLOAD_SUCCESS" = false ]; then
+              echo "❌ Failed to upload part $CURRENT_PART after $MAX_RETRIES attempts!"
+              exit 1
+            fi
+            
+            # Add delay between uploads to avoid rate limiting
+            sleep 2
+          done
+          
+          # Save upload log
+          cat /tmp/upload_log
+          echo "✅ All $TOTAL_PARTS parts uploaded successfully!"
+          
+      - name: 📝 Send completion message
+        env:
+          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          BALE_CHAT_ID: ${{ secrets.BALE_CHAT_ID }}
+        run: |
+          TOTAL_PARTS=$(ls temp_split/*.7z* 2>/dev/null | wc -l)
+          TOTAL_VIDEOS="${{ env.TOTAL_VIDEOS }}"
+          
+          if [ "${{ github.event.inputs.format }}" = "audio" ]; then
+            TYPE="🎵 Audio"
+          else
+            TYPE="🎬 Video"
+          fi
+          
+          MESSAGE="✅ *Download Complete!*%0A%0A"
+          MESSAGE="${MESSAGE}🎯 *Type:* ${TYPE}%0A"
+          MESSAGE="${MESSAGE}🎬 *Videos:* ${TOTAL_VIDEOS}%0A"
+          MESSAGE="${MESSAGE}📦 *Total Parts:* ${TOTAL_PARTS}%0A"
+          MESSAGE="${MESSAGE}%0A💡 *To extract each video:*%0A"
+          MESSAGE="${MESSAGE}Download all parts for a video and run:%0A"
+          MESSAGE="${MESSAGE}\`7z x video_name.7z.001\`%0A%0A"
+          MESSAGE="${MESSAGE}Each video is compressed separately."
+          
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${BALE_CHAT_ID}\",\"text\":\"${MESSAGE}\",\"parse_mode\":\"Markdown\"}"
+          
+          echo "✅ Completion message sent!"
+          
+      - name: 🧹 Cleanup
+        run: |
+          rm -rf temp_split downloads
+          rm -f cookies.txt cookies_enc.txt
+          echo "🧹 Cleanup completed"
+
