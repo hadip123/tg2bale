@@ -1,0 +1,346 @@
+name: '📥 YouTube Download & Archive (to Google Drive)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_urls:
+        description: '🔗 YouTube video URLs (comma separated)'
+        required: true
+        type: string
+      format:
+        description: '📁 Format (video/audio)'
+        required: false
+        type: choice
+        default: 'video'
+        options:
+          - 'video'
+          - 'audio'
+      password:
+        description: '🔐 Zip password (optional)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: '📦 Split size per part (default: 95m)'
+        required: false
+        type: string
+        default: '95m'
+      gdrive_folder_id:
+        description: '📁 Google Drive Folder ID (optional, uses root if empty)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download-youtube-and-upload:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --user root
+    steps:
+      - name: ⚙️ Install dependencies (Arch)
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm curl wget p7zip ffmpeg file nodejs npm python python-pip git base-devel
+          npm install -g jsdom
+          pip install yt-dlp google-api-python-client google-auth-httplib2 google-auth-oauthlib --break-system-packages
+          
+          # Install gdrive CLI
+          wget https://github.com/glotlabs/gdrive/releases/download/3.9.0/gdrive_linux-x64.tar.gz
+          tar -xzf gdrive_linux-x64.tar.gz
+          mv gdrive /usr/local/bin/
+          chmod +x /usr/local/bin/gdrive
+          
+          # Ensure yt-dlp uses node
+          yt-dlp --version
+
+      - name: 🍪 Set up cookies (if available)
+        run: |
+          if [ -n "${{ secrets.YT_COOKIES }}" ]; then
+            curl -L https://raw.githubusercontent.com/hadip123/tg2bale/refs/heads/main/cookies.txt -o cookies_enc.txt
+            openssl enc -aes-128-cbc -base64 -d -in cookies_enc.txt -out cookies.txt -pass pass:"${{ secrets.YT_COOKIES }}"
+            echo "✅ Cookies loaded"
+          fi
+
+      - name: 📊 Download from YouTube
+        id: download
+        run: |
+          IFS=',' read -ra URLS <<< "${{ github.event.inputs.youtube_urls }}"
+          FORMAT="${{ github.event.inputs.format }}"
+          
+          echo "Node version: $(node --version)"
+          echo "yt-dlp version: $(yt-dlp --version)"
+          
+          YT_CMD_BASE="yt-dlp --js-runtimes node --remote-components ejs:github"
+          
+          if [ -f "cookies.txt" ]; then
+            YT_CMD_BASE="$YT_CMD_BASE --cookies cookies.txt"
+          fi
+          
+          if [ "$FORMAT" = "audio" ]; then
+            YT_CMD_BASE="$YT_CMD_BASE -x --audio-format mp3 --audio-quality 0 --embed-metadata"
+          else
+            YT_CMD_BASE="$YT_CMD_BASE -S 'height:480'"
+          fi
+          
+          mkdir -p downloads
+          
+          TOTAL_VIDEOS=${#URLS[@]}
+          CURRENT_VIDEO=0
+          ALL_TITLES=""
+          
+          for URL in "${URLS[@]}"; do
+            CURRENT_VIDEO=$((CURRENT_VIDEO + 1))
+            URL=$(echo "$URL" | xargs)
+
+            echo ""
+            echo "========================================="
+            echo "📥 Downloading video $CURRENT_VIDEO of $TOTAL_VIDEOS"
+            echo "🔗 URL: $URL"
+            echo "========================================="
+            
+            if [ "$FORMAT" = "audio" ]; then
+              OUTPUT_TEMPLATE="downloads/%(channel)s - %(upload_date)s - %(title)s_audio.%(ext)s"
+            else
+              OUTPUT_TEMPLATE="downloads/%(channel)s - %(upload_date)s - %(title)s_video.%(ext)s"
+            fi
+            
+            YT_CMD="$YT_CMD_BASE --output \"$OUTPUT_TEMPLATE\" \"$URL\""
+
+            echo "🎯 Output pattern: $OUTPUT_TEMPLATE"
+            echo "Executing: $YT_CMD"
+            eval $YT_CMD
+
+            if [ $? -ne 0 ]; then
+              echo "❌ Failed to download: $URL"
+              exit 1
+            fi
+
+            DOWNLOADED_FILE=$(ls -t downloads/* 2>/dev/null | head -n1)
+
+            if [ -z "$DOWNLOADED_FILE" ] || [ ! -f "$DOWNLOADED_FILE" ]; then
+              echo "❌ Cannot find downloaded file for: $URL"
+              exit 1
+            fi
+
+            echo "✅ Downloaded: $(basename "$DOWNLOADED_FILE")"
+            ls -lh "$DOWNLOADED_FILE"
+
+            SAFE_NAME=$(basename "$DOWNLOADED_FILE" | sed 's/\.[^.]*$//')
+            ALL_TITLES="${ALL_TITLES}${SAFE_NAME}\n"
+          done
+          
+          echo "ALL_TITLES=$ALL_TITLES" >> $GITHUB_ENV
+          echo "TOTAL_VIDEOS=$TOTAL_VIDEOS" >> $GITHUB_ENV
+          
+      - name: 🗜️ Compress and split each video
+        run: |
+          mkdir -p temp_split
+          rm -f temp_split/*.7z*
+          
+          TOTAL_VIDEOS="${{ env.TOTAL_VIDEOS }}"
+          CURRENT_VIDEO=0
+          
+          for FILE in downloads/*; do
+            CURRENT_VIDEO=$((CURRENT_VIDEO + 1))
+            FILENAME=$(basename "$FILE")
+            BASENAME=$(echo "$FILENAME" | sed 's/\.[^.]*$//')
+            
+            echo ""
+            echo "========================================="
+            echo "📦 Processing video $CURRENT_VIDEO of $TOTAL_VIDEOS: $BASENAME"
+            echo "========================================="
+            
+            if [ -z "${{ github.event.inputs.password }}" ]; then
+              7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "temp_split/${BASENAME}.7z" "$FILE"
+            else
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "temp_split/${BASENAME}.7z" "$FILE"
+            fi
+            
+            echo "✅ Created split files for: $BASENAME"
+          done
+          
+          echo "✅ All videos processed"
+          ls -lh temp_split/
+          
+      - name: 🔐 Setup Google Drive Service Account
+        run: |
+          if [ -z "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" ]; then
+            echo "❌ GDRIVE_SERVICE_ACCOUNT_JSON secret not set!"
+            exit 1
+          fi
+          
+          echo '${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}' > service_account.json
+          echo "✅ Service account JSON saved"
+          
+      - name: 📤 Upload parts to Google Drive
+        env:
+          GDRIVE_FOLDER_ID: ${{ github.event.inputs.gdrive_folder_id }}
+        run: |
+          # Setup gdrive with service account
+          export GDRIVE_SERVICE_ACCOUNT_JSON_PATH="$(pwd)/service_account.json"
+          
+          TOTAL_PARTS=$(ls temp_split/*.7z* 2>/dev/null | wc -l)
+          CURRENT_PART=0
+          CURRENT_VIDEO=""
+          VIDEO_COUNTER=1
+          
+          UPLOAD_LOG="/tmp/upload_log.txt"
+          
+          # Create folder if specified
+          if [ -n "$GDRIVE_FOLDER_ID" ]; then
+            echo "📁 Using folder ID: $GDRIVE_FOLDER_ID"
+            FOLDER_PARAM="--parent $GDRIVE_FOLDER_ID"
+          else
+            echo "📁 Uploading to root folder"
+            FOLDER_PARAM=""
+          fi
+          
+          # Initialize log file
+          echo "🚀 Starting upload of $TOTAL_PARTS parts to Google Drive..." > $UPLOAD_LOG
+          
+          # Create a summary array for video parts
+          declare -A VIDEO_PARTS
+          
+          for FILE in temp_split/*.7z*; do
+            CURRENT_PART=$((CURRENT_PART + 1))
+            FILENAME=$(basename "$FILE")
+            FILE_SIZE=$(stat -c%s "$FILE")
+            FILE_SIZE_MB=$((FILE_SIZE / 1048576))
+            
+            # Extract video name from filename
+            VIDEO_NAME=$(echo "$FILENAME" | sed 's/\.7z\.[0-9]*$//' | sed 's/\.7z$//')
+            
+            # Track parts per video
+            VIDEO_PARTS["$VIDEO_NAME"]=$((${VIDEO_PARTS["$VIDEO_NAME"]:-0} + 1))
+            
+            # Check if we moved to a new video
+            if [ "$VIDEO_NAME" != "$CURRENT_VIDEO" ]; then
+              if [ -n "$CURRENT_VIDEO" ]; then
+                echo "" >> $UPLOAD_LOG
+              fi
+              CURRENT_VIDEO="$VIDEO_NAME"
+              echo "" >> $UPLOAD_LOG
+              echo "📹 Video $VIDEO_COUNTER: $VIDEO_NAME" >> $UPLOAD_LOG
+              VIDEO_COUNTER=$((VIDEO_COUNTER + 1))
+            fi
+            
+            echo "📤 Uploading part $CURRENT_PART of $TOTAL_PARTS: $FILENAME (${FILE_SIZE_MB} MB)"
+            echo "  Part $CURRENT_PART of $VIDEO_NAME" >> $UPLOAD_LOG
+            
+            MAX_RETRIES=5
+            RETRY_COUNT=0
+            UPLOAD_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$UPLOAD_SUCCESS" = false ]; do
+              # Use gdrive CLI to upload
+              if [ -n "$FOLDER_PARAM" ]; then
+                UPLOAD_OUTPUT=$(gdrive files upload $FOLDER_PARAM "$FILE" 2>&1)
+              else
+                UPLOAD_OUTPUT=$(gdrive files upload "$FILE" 2>&1)
+              fi
+              
+              if echo "$UPLOAD_OUTPUT" | grep -q "Uploaded"; then
+                FILE_ID=$(echo "$UPLOAD_OUTPUT" | grep -oP 'Id: \K\S+' | head -1)
+                echo "✅ Part $CURRENT_PART uploaded successfully! ID: $FILE_ID"
+                echo "  ✅ Part $CURRENT_PART - ID: $FILE_ID" >> $UPLOAD_LOG
+                UPLOAD_SUCCESS=true
+              else
+                echo "❌ Upload failed (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+                echo "Error: $UPLOAD_OUTPUT"
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  echo "🔄 Retrying in 3 seconds..."
+                  sleep 3
+                fi
+              fi
+            done
+            
+            if [ "$UPLOAD_SUCCESS" = false ]; then
+              echo "❌ Failed to upload part $CURRENT_PART after $MAX_RETRIES attempts!"
+              exit 1
+            fi
+            
+            # Add delay between uploads to avoid rate limiting
+            sleep 2
+          done
+          
+          # Save upload log
+          cat $UPLOAD_LOG
+          echo "✅ All $TOTAL_PARTS parts uploaded successfully!"
+          
+          # Create a manifest file with all parts
+          echo "📝 Creating manifest file..." >> $UPLOAD_LOG
+          echo "" >> $UPLOAD_LOG
+          echo "📊 UPLOAD SUMMARY:" >> $UPLOAD_LOG
+          echo "Total parts: $TOTAL_PARTS" >> $UPLOAD_LOG
+          echo "Videos processed:" >> $UPLOAD_LOG
+          
+          for VIDEO in "${!VIDEO_PARTS[@]}"; do
+            echo "  - $VIDEO: ${VIDEO_PARTS[$VIDEO]} parts" >> $UPLOAD_LOG
+          done
+          
+          # Save manifest as file
+          cp $UPLOAD_LOG upload_manifest.txt
+          
+      - name: 📝 Upload manifest and send notification
+        run: |
+          # Upload the manifest file to Google Drive as well
+          export GDRIVE_SERVICE_ACCOUNT_JSON_PATH="$(pwd)/service_account.json"
+          
+          if [ -n "${{ github.event.inputs.gdrive_folder_id }}" ]; then
+            FOLDER_PARAM="--parent ${{ github.event.inputs.gdrive_folder_id }}"
+          else
+            FOLDER_PARAM=""
+          fi
+          
+          # Upload manifest
+          gdrive files upload $FOLDER_PARAM upload_manifest.txt
+          
+          TOTAL_PARTS=$(ls temp_split/*.7z* 2>/dev/null | wc -l)
+          TOTAL_VIDEOS="${{ env.TOTAL_VIDEOS }}"
+          
+          if [ "${{ github.event.inputs.format }}" = "audio" ]; then
+            TYPE="🎵 Audio"
+          else
+            TYPE="🎬 Video"
+          fi
+          
+          # Generate a shareable link for the folder (if folder ID is set)
+          SHARE_MESSAGE=""
+          if [ -n "${{ github.event.inputs.gdrive_folder_id }}" ]; then
+            SHARE_MESSAGE="%0A%0A🔗 *Google Drive Folder:*%0A"
+            SHARE_MESSAGE="${SHARE_MESSAGE}https://drive.google.com/drive/folders/${{ github.event.inputs.gdrive_folder_id }}"
+          fi
+          
+          # Create a detailed completion message
+          echo ""
+          echo "========================================="
+          echo "✅ DOWNLOAD AND UPLOAD COMPLETE!"
+          echo "========================================="
+          echo "Type: $TYPE"
+          echo "Videos: $TOTAL_VIDEOS"
+          echo "Total Parts: $TOTAL_PARTS"
+          if [ -n "${{ github.event.inputs.gdrive_folder_id }}" ]; then
+            echo "Google Drive Folder: https://drive.google.com/drive/folders/${{ github.event.inputs.gdrive_folder_id }}"
+          fi
+          echo "========================================="
+          
+          # You can optionally add webhook notifications here (e.g., to Discord, Telegram, etc.)
+          # Example for Discord webhook:
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"content\": \"✅ YouTube Download Complete!\nType: ${TYPE}\nVideos: ${TOTAL_VIDEOS}\nTotal Parts: ${TOTAL_PARTS}\nGoogle Drive: https://drive.google.com/drive/folders/${{ github.event.inputs.gdrive_folder_id }}\"
+              }"
+          fi
+          
+      - name: 🧹 Cleanup
+        run: |
+          rm -rf temp_split downloads
+          rm -f cookies.txt cookies_enc.txt service_account.json upload_manifest.txt
+          echo "🧹 Cleanup completed"
